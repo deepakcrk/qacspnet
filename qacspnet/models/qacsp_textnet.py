@@ -88,15 +88,25 @@ class QACSPTextNet(nn.Module):
         #   "fpn"     per level 1x1 conv + BN + SiLU to the stride-4 channel count, upsampled
         #             (height and width) to the stride-4 map, appended, 1x1 conv + BN + SiLU
         #             -> W/4 steps (stride-4 shape)
-        assert level_fusion in ("time", "channel", "fpn"), level_fusion
+        # the following share the fpn lateral / upsampling step (strides 8 and 16 brought to
+        # the stride-4 grid with c0 channels, see fpn_upsample) but combine the maps differently:
+        #   "add"     element-wise sum of the three maps, then 3x3 conv + BN + SiLU
+        #   "asff"    adaptive spatial fusion: a 1x1 conv on the concatenated maps predicts one
+        #             weight per level and position (softmax over levels), weighted sum, then
+        #             3x3 conv + BN + SiLU
+        #   "sk"      selective-kernel fusion: GAP of the summed maps -> FC -> ReLU -> FC gives
+        #             one weight per level and channel (softmax over levels), weighted sum,
+        #             then 3x3 conv + BN + SiLU
+        assert level_fusion in ("time", "channel", "fpn", "add", "asff", "sk"), level_fusion
         self.level_fusion = level_fusion
+        self.grid_fusion = level_fusion in ("fpn", "add", "asff", "sk")  # stride-4 grid output
         # training only (channel fusion): for this fraction of images one randomly chosen level
         # is zeroed, so the model cannot rely on a single level
         self.level_dropout = level_dropout
         # height -> 1 per column: "none" flattens C x H into the step vector (default),
         # "avg" / "max" pool over the height (vertical-shift invariant, step vector = C)
         # "conv": CRNN-style learned collapse, 3x1 convs with vertical stride 2 until the height
-        # is <= 3, then an (H x 1) conv to height 1 (BN + SiLU after each); only with fpn fusion
+        # is <= 3, then an (H x 1) conv to height 1 (BN + SiLU after each); grid fusions only
         assert height_pool in ("none", "avg", "max", "conv"), height_pool
         self.height_pool = height_pool
         # how strides 8 / 16 reach the stride-4 grid in the fpn block: fixed bilinear, or learned
@@ -119,7 +129,7 @@ class QACSPTextNet(nn.Module):
         if h % 16 or w % 16:
             raise ValueError(f"img_size {img_size}: height and width must be multiples of 16")
         self.img_size = (h, w)
-        self.seq_len = w // 4 if level_fusion in ("channel", "fpn") else w // 4 + w // 8 + w // 16
+        self.seq_len = w // 4 if (level_fusion == "channel" or self.grid_fusion) else w // 4 + w // 8 + w // 16
         feat_dims = [
             int(c * width) * (h // s)
             for c, s in zip(self.backbone.in_channels, (4, 8, 16))
@@ -128,12 +138,13 @@ class QACSPTextNet(nn.Module):
         n_in = feat_dims[0] * (3 if level_fusion == "channel" else 1)
         if height_pool in ("avg", "max"):
             n_in //= (h // 4)  # pooled: channels only (C instead of C * H per level)
-        if level_fusion == "fpn":
+        if self.grid_fusion:
             chans = [int(c * width) for c in self.backbone.in_channels]
             c0 = chans[0]
 
-            def cbs(ci, co):
-                return nn.Sequential(nn.Conv2d(ci, co, 1, bias=False), nn.BatchNorm2d(co), nn.SiLU())
+            def cbs(ci, co, k=1):
+                return nn.Sequential(nn.Conv2d(ci, co, k, padding=k // 2, bias=False),
+                                     nn.BatchNorm2d(co), nn.SiLU())
 
             if fpn_upsample == "shuffle":  # 1x1 conv to c0 * r^2 channels, then pixel shuffle (r)
                 self.fuse_lat = nn.ModuleList([cbs(c, c0 * r * r) for c, r in zip(chans[1:], (2, 4))])
@@ -144,12 +155,21 @@ class QACSPTextNet(nn.Module):
                     for c, r in zip(chans[1:], (2, 4))])
             else:
                 self.fuse_lat = nn.ModuleList([cbs(c, c0) for c in chans[1:]])  # strides 8, 16
-            self.fuse_out = cbs(3 * c0, c0)
-            # residual fusion: output = stride-4 map + fuse_out(...); the last BN starts at
-            # zero so the block initially passes the stride-4 map through unchanged
-            nn.init.zeros_(self.fuse_out[1].weight)
+            if level_fusion == "fpn":
+                self.fuse_out = cbs(3 * c0, c0)
+                # residual fusion: output = stride-4 map + fuse_out(...); the last BN starts at
+                # zero so the block initially passes the stride-4 map through unchanged
+                nn.init.zeros_(self.fuse_out[1].weight)
+            else:
+                if level_fusion == "asff":
+                    self.fuse_weight = nn.Conv2d(3 * c0, 3, 1)  # B x 3 x h0 x w0 level logits
+                elif level_fusion == "sk":
+                    hid = max(c0 // 4, 16)
+                    self.fuse_weight = nn.Sequential(
+                        nn.Linear(c0, hid), nn.ReLU(inplace=True), nn.Linear(hid, 3 * c0))
+                self.fuse_out = cbs(c0, c0, 3)
         if height_pool == "conv":
-            assert level_fusion == "fpn", "--height-pool conv needs --level-fusion fpn"
+            assert self.grid_fusion, "--height-pool conv needs a grid fusion (fpn / add / asff / sk)"
             hcur, layers, cout = h // 4, [], 256
             while hcur > 3:
                 layers += [nn.Conv2d(c0, c0, (3, 1), (2, 1), (1, 0), bias=False), nn.BatchNorm2d(c0), nn.SiLU()]
@@ -205,10 +225,25 @@ class QACSPTextNet(nn.Module):
             return f.amax(dim=2)
         return f.reshape(b, c * h, w)
 
+    def _fuse_grid(self, maps):
+        """Three B x c0 x h0 x w0 maps (strides 4, 8, 16 on the stride-4 grid) -> one map."""
+        if self.level_fusion == "fpn":
+            return maps[0] + self.fuse_out(torch.cat(maps, dim=1))
+        if self.level_fusion == "add":
+            return self.fuse_out(maps[0] + maps[1] + maps[2])
+        stack = torch.stack(maps, dim=1)  # B x 3 x c0 x h0 x w0
+        if self.level_fusion == "asff":
+            w = torch.softmax(self.fuse_weight(torch.cat(maps, dim=1)), dim=1)  # B x 3 x h0 x w0
+            return self.fuse_out((stack * w[:, :, None]).sum(dim=1))
+        # sk: channel-wise level selection from the globally pooled sum
+        s = (maps[0] + maps[1] + maps[2]).mean(dim=(2, 3))  # B x c0
+        w = torch.softmax(self.fuse_weight(s).view(s.shape[0], 3, -1), dim=1)  # B x 3 x c0
+        return self.fuse_out((stack * w[:, :, :, None, None]).sum(dim=1))
+
     def encode_features(self, x):
         """Image -> encoder output, T x B x D."""
         feats = self.backbone(x)  # fine -> coarse
-        if self.level_fusion == "fpn":
+        if self.grid_fusion:
             f0 = feats[0]
             h0, w0 = f0.shape[-2:]
             maps = [f0]
@@ -229,7 +264,7 @@ class QACSPTextNet(nn.Module):
                 which = torch.randint(0, len(maps), (b,), device=x.device)
                 maps = [m_ * (~(drop & (which == i))).to(m_.dtype)[:, None, None, None]
                         for i, m_ in enumerate(maps)]
-            f = maps[0] + self.fuse_out(torch.cat(maps, dim=1))  # B x c0 x h0 x w0
+            f = self._fuse_grid(maps)  # B x c0 x h0 x w0
             b, c, h, w = f.shape
             col = self._collapse(f)  # B x (C*H or C) x W0
             seq = self.fc_in(col.permute(2, 0, 1))  # W0 x B x embed_dim

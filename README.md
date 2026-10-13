@@ -12,6 +12,12 @@ pip install -r requirements.txt
 pip install -v -e .
 ```
 
+## Trained weights
+
+Trained checkpoints can be downloaded from
+[OneDrive](https://amritavishwavidyapeetham-my.sharepoint.com/:u:/g/personal/cr_deepak_cb_students_amrita_edu/IQDS63ekuM11Q7G-LiTTHoOdAXMwOKY7gp1tT_byRwkeUVQ?e=nOBkyU).
+Pass the downloaded `.pth` file to `-c` (detection) or `--ckpt` (recognition) in the commands below.
+
 ## Data
 
 ```bash
@@ -49,6 +55,7 @@ to the train command, e.g. `... --fp16 qge_type local use_gce True`.
 | `qge_alpha_init` | `0.5` | Initial (or fixed) QGE blend factor. |
 | `qge_reduction` | `8` | QGE FC hidden size is max(C / `qge_reduction`, 8). |
 | `qge_spatial_kernel` | `7` | Kernel of the QGE spatial branch (odd). |
+| `qge_gate` | `sigmoid` | QGE gate: `sigmoid` (gate in (0, 1), so each channel/position is scaled within [1 - alpha, 1]) or `free` (no sigmoid, raw scores, the scale is unconstrained). |
 | `bottleneck_dilation` | `2` | Dilation of the bottleneck's depthwise path. |
 | `act` | `silu` | Activation: `silu`, `relu` or `lrelu`. |
 | `stem_type` | `focus` | Stride-2 stem: `focus` or `conv` (one strided convolution). |
@@ -59,11 +66,12 @@ to the train command, e.g. `... --fp16 qge_type local use_gce True`.
 | `gce_ff_ratio` | `2.0` | GCE feed-forward size as a multiple of the channels. |
 | `gce_dropout` | `0.0` | GCE dropout. |
 | `use_afw` | `True` | AFW module. |
-| `afw_type` | `mlp` | AFW weight predictor: `mlp` or `attn` (self-attention over levels). |
-| `afw_layers` | `3` | AFW MLP layers, or attention layers with `attn`. |
-| `afw_hidden` | `None` | AFW hidden size (default: sum of level channels / 4; 2 x `afw_attn_dim` with `attn`). |
+| `afw_type` | `mlp` | AFW weight predictor: `mlp`, `deep` (wider projection + residual LayerNorm MLP blocks, for a much bigger AFW) or `attn` (self-attention over levels). |
+| `afw_layers` | `3` | AFW MLP layers, residual blocks with `deep`, or attention layers with `attn`. |
+| `afw_hidden` | `None` | AFW hidden size (default: sum of level channels / 4; sum of level channels with `deep`; 2 x `afw_attn_dim` with `attn`). |
 | `afw_attn_dim` | `128` | AFW token size with `attn`. |
 | `afw_heads` | `4` | AFW attention heads with `attn`. |
+| `afw_weight` | `softmax` | How AFW scores become level weights: `softmax` (weights sum to 1, so the strides share a fixed total), `sigmoid` (independent gate in (0, 1) per stride), or `free` (each stride scaled by 1 + score, no normalization, floor or cap). |
 | `num_shared_convs` | `3` | Shared 3x3 convs in the head. |
 | `head_width` | `1.0` | Head channel multiplier. |
 | `target_head_flops` | `None` | Head share of total FLOPs; sets `head_width` automatically. |
@@ -172,6 +180,7 @@ python tools/train_textnet.py --variant s --root datasets/COCOText_words \
 | `--qge-alpha-init` | `0.5` | Initial (or fixed) QGE blend factor. |
 | `--qge-reduction` | `8` | QGE FC hidden size is max(C / r, 8). |
 | `--qge-spatial-kernel` | `7` | Kernel of the QGE spatial branch (odd). |
+| `--qge-gate` | `sigmoid` | `sigmoid` (scale within [1 - alpha, 1]) or `free` (unconstrained scale per channel/position). |
 | `--bottleneck-dilation` | `2` | Dilation of the bottleneck's depthwise path. |
 | `--act` | `silu` | Activation: `silu`, `relu` or `lrelu`. |
 | `--gce` | off | Global Context Encoder on the coarsest backbone map. |
@@ -179,11 +188,12 @@ python tools/train_textnet.py --variant s --root datasets/COCOText_words \
 | `--gce-heads` | `8` | GCE attention heads. |
 | `--gce-ff-ratio` | `2.0` | GCE feed-forward size as a multiple of the channels. |
 | `--no-afw` | off | Remove the AFW module. |
-| `--afw-type` | `mlp` | AFW weight predictor: `mlp` or `attn`. |
-| `--afw-layers` | `3` | AFW MLP layers, or attention layers with `attn`. |
-| `--afw-hidden` | | AFW hidden size. |
+| `--afw-type` | `mlp` | AFW weight predictor: `mlp`, `deep` (wider projection + residual LayerNorm MLP blocks) or `attn`. E.g. `--afw-type deep --afw-layers 6 --afw-hidden 1024` for a much bigger AFW. |
+| `--afw-layers` | `3` | AFW MLP layers, residual blocks with `deep`, or attention layers with `attn`. |
+| `--afw-hidden` | | AFW hidden size (default: sum of level channels / 4; sum of level channels with `deep`). |
 | `--afw-attn-dim` | `128` | AFW token size with `attn`. |
 | `--afw-heads` | `4` | AFW attention heads with `attn`. |
+| `--afw-weight` | `softmax` | `softmax` (weights sum to 1), `sigmoid` (independent gate per stride), or `free` (unconstrained scale per stride). |
 | `--encoder` | `blstm` | Sequence encoder: `blstm`, `transformer` or `none`. |
 | `--enc-layers` | `2` | BLSTM or Transformer encoder layers. |
 | `--hidden` | `256` | BLSTM hidden units per direction. |
@@ -195,6 +205,10 @@ python tools/train_textnet.py --variant s --root datasets/COCOText_words \
 | `--num-heads` | `4` | Attention heads in the Transformer encoder and decoder. |
 | `--ff-dim` | `1024` | Transformer feed-forward size. |
 | `--dropout` | `0.1` | Transformer dropout. |
+| `--level-fusion` | `time` | How the three backbone levels (strides 4, 8, 16) are fused: `time` (concatenated along time), `channel` (upsampled to the stride-4 width, concatenated per position), `fpn` (on the stride-4 grid: concat + 1x1 conv, residual), `add` (sum + 3x3 conv), `asff` (per-position softmax weights over the levels, weighted sum + 3x3 conv) or `sk` (per-channel softmax weights over the levels from a pooled FC, weighted sum + 3x3 conv). |
+| `--fpn-upsample` | `bilinear` | With `fpn` / `add` / `asff` / `sk`: how strides 8 and 16 reach the stride-4 grid: `bilinear`, `shuffle` (1x1 conv + pixel shuffle) or `deconv`. |
+| `--height-pool` | `none` | Height to one value per column: `none` (flatten C x H), `avg`, `max` or `conv` (CRNN-style strided convs, grid fusions only). |
+| `--level-dropout` | `0.0` | Training only, with `channel` / grid fusions: fraction of images with one random level zeroed. |
 | `--ckpt` | | Checkpoint to load. |
 | `--eval-only` | off | Evaluate `--ckpt` on `--test` without training. |
 | `--resume` | | Continue from `last_state.pth`. |

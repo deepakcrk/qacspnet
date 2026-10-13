@@ -1073,6 +1073,9 @@ def main():
     ap.add_argument("--qge-alpha-init", type=float, default=0.5, help="initial (or fixed) alpha")
     ap.add_argument("--qge-reduction", type=int, default=8, help="QGE FC hidden = max(C / r, 8)")
     ap.add_argument("--qge-spatial-kernel", type=int, default=7, help="QGE spatial kernel (odd)")
+    ap.add_argument("--qge-gate", default="sigmoid", choices=["sigmoid", "free"],
+                    help="QGE gate: sigmoid (in (0, 1), output scaled within [1 - alpha, 1]) or "
+                         "free (no sigmoid: raw scores, scale per channel/position unconstrained)")
     ap.add_argument("--bottleneck-dilation", type=int, default=2,
                     help="dilation of the bottleneck's depthwise path")
     ap.add_argument("--act", default="silu", choices=["silu", "relu", "lrelu"],
@@ -1090,13 +1093,21 @@ def main():
     ap.add_argument("--gce-layers", type=int, default=1)
     ap.add_argument("--gce-heads", type=int, default=8)
     ap.add_argument("--gce-ff-ratio", type=float, default=2.0)
-    ap.add_argument("--afw-type", default="mlp", choices=["mlp", "attn"],
-                    help="AFW weight predictor: MLP or self-attention over the levels")
+    ap.add_argument("--afw-type", default="mlp", choices=["mlp", "deep", "attn"],
+                    help="AFW weight predictor: plain MLP, deep (wider projection + residual "
+                         "LayerNorm MLP blocks; e.g. --afw-layers 6 --afw-hidden 1024 to test "
+                         "a much bigger AFW) or self-attention over the levels")
     ap.add_argument("--afw-layers", type=int, default=3,
-                    help="AFW MLP layers, or self-attention layers with --afw-type attn")
+                    help="AFW MLP layers, residual blocks with --afw-type deep, or "
+                         "self-attention layers with --afw-type attn")
     ap.add_argument("--afw-hidden", type=int, default=None,
-                    help="AFW MLP hidden units (default: sum of level channels / 4); "
-                         "feed-forward size with --afw-type attn (default: 2 x --afw-attn-dim)")
+                    help="AFW MLP hidden units (default: sum of level channels / 4); width with "
+                         "--afw-type deep (default: sum of level channels); feed-forward size "
+                         "with --afw-type attn (default: 2 x --afw-attn-dim)")
+    ap.add_argument("--afw-weight", default="softmax", choices=["softmax", "sigmoid", "free"],
+                    help="how AFW scores become level weights: softmax (sum to 1, levels share a "
+                         "fixed total), sigmoid (independent gate in (0, 1) per level), or free "
+                         "(each level scaled by 1 + score: no normalization, floor or cap)")
     ap.add_argument("--afw-min-weight", type=float, default=0.0,
                     help="floor on each AFW level weight: w = m + (1 - n*m) * softmax "
                          "(0 = original AFW; e.g. 0.2 keeps every level at 0.2-0.6)")
@@ -1110,7 +1121,7 @@ def main():
     ap.add_argument("--afw-norm-input", action="store_true",
                     help="parameter-free LayerNorm of each level's pooled vector before AFW")
     ap.add_argument("--level-dropout", type=float, default=0.0,
-                    help="training only, --level-fusion channel: fraction of images with one "
+                    help="training only, --level-fusion channel / fpn / add / asff / sk: fraction of images with one "
                          "random level zeroed")
     ap.add_argument("--afw-attn-dim", type=int, default=128, help="AFW token size (attn)")
     ap.add_argument("--afw-heads", type=int, default=4, help="AFW attention heads (attn)")
@@ -1129,14 +1140,20 @@ def main():
     ap.add_argument("--num-heads", type=int, default=4, help="attention heads (encoder and decoder)")
     ap.add_argument("--ff-dim", type=int, default=1024, help="Transformer feed-forward size")
     ap.add_argument("--dropout", type=float, default=0.1, help="Transformer dropout")
-    ap.add_argument("--level-fusion", default="time", choices=["time", "channel", "fpn"],
+    ap.add_argument("--level-fusion", default="time",
+                    choices=["time", "channel", "fpn", "add", "asff", "sk"],
                     help="time: levels concatenated along time (original); channel: strides 8 "
-                         "and 16 upsampled to the stride-4 width and concatenated per position")
+                         "and 16 upsampled to the stride-4 width and concatenated per position; "
+                         "fpn: levels on the stride-4 grid, concat + 1x1 conv, residual; "
+                         "add: sum of the levels on the stride-4 grid + 3x3 conv; "
+                         "asff: per-position softmax weights over the levels (1x1 conv), "
+                         "weighted sum + 3x3 conv; sk: per-channel softmax weights over the "
+                         "levels (GAP + FC), weighted sum + 3x3 conv")
     ap.add_argument("--height-pool", default="none", choices=["none", "avg", "max", "conv"],
                     help="height -> 1 per column: flatten C x H (none), pool over height (avg / "
-                         "max) or CRNN-style strided 3x1 convs (conv, fpn fusion only)")
+                         "max) or CRNN-style strided 3x1 convs (conv, grid fusions only)")
     ap.add_argument("--fpn-upsample", default="bilinear", choices=["bilinear", "shuffle", "deconv"],
-                    help="fpn fusion: how strides 8 / 16 reach the stride-4 grid")
+                    help="fpn / add / asff / sk fusion: how strides 8 / 16 reach the stride-4 grid")
     ap.add_argument("--rnn-dropout", type=float, default=0.0, help="dropout between BLSTM layers")
     ap.add_argument("--metrics-out", default=None, help="json with final test accuracies")
     args = ap.parse_args()
@@ -1156,13 +1173,15 @@ def main():
                      invert=not args.qge_normal_gate, alpha_mode=args.qge_alpha,
                      alpha_init=args.qge_alpha_init, reduction=args.qge_reduction,
                      spatial_kernel=args.qge_spatial_kernel, dilation=args.bottleneck_dilation,
+                     gate_mode=args.qge_gate,
                      **({"use_spatial": False} if args.qge_no_spatial else {})),
         gce_cfg=dict(num_layers=args.gce_layers, num_heads=args.gce_heads,
                      ff_ratio=args.gce_ff_ratio) if args.gce else None,
         afw_cfg=dict(afw_type=args.afw_type, num_layers=args.afw_layers, hidden=args.afw_hidden,
                      attn_dim=args.afw_attn_dim, num_heads=args.afw_heads,
                      min_weight=args.afw_min_weight, norm_input=args.afw_norm_input,
-                     base=args.afw_base, share=args.afw_share, per_column=args.afw_per_column),
+                     base=args.afw_base, share=args.afw_share, per_column=args.afw_per_column,
+                     weight_mode=args.afw_weight),
         encoder=args.encoder, enc_layers=args.enc_layers, hidden=args.hidden,
         embed_dim=args.embed_dim, decoder=args.decoder, dec_layers=args.dec_layers,
         dec_dim=args.dec_dim, num_heads=args.num_heads, ff_dim=args.ff_dim,

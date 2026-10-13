@@ -33,6 +33,9 @@ class QACSPNetExp(Exp):
         self.qge_alpha_init = 0.5   # initial (or fixed) alpha
         self.qge_reduction = 8      # QGE FC hidden size = max(C / reduction, 8)
         self.qge_spatial_kernel = 7  # QGE spatial-branch kernel (odd)
+        # "sigmoid": gate in (0, 1), output scaled within [1 - alpha, 1];
+        # "free": no sigmoid, raw scores, scale per channel/position unconstrained
+        self.qge_gate = "sigmoid"
         self.bottleneck_dilation = 2  # dilation of the bottleneck's depthwise path
         self.arw_ar_cap = 1.0       # cap on the aspect-ratio difference in arw_siou
         self.arw_iou_power = 2.0    # IoU exponent in arw_siou
@@ -46,12 +49,17 @@ class QACSPNetExp(Exp):
         self.gce_ff_ratio = 2.0     # feed-forward size = channels x gce_ff_ratio
         self.gce_dropout = 0.0
         self.use_afw = True         # adaptive FPN weighting
-        self.afw_type = "mlp"       # "mlp" | "attn" (self-attention over the levels)
-        self.afw_layers = 3         # MLP layers, or self-attention layers for "attn"
+        self.afw_type = "mlp"       # "mlp" | "deep" (residual MLP blocks) | "attn" (self-attention)
+        self.afw_layers = 3         # MLP layers, residual blocks for "deep", or attention layers
         self.afw_hidden = None      # MLP hidden units (None: sum of level channels / 4);
+                                    # width for "deep" (None: sum of level channels);
                                     # feed-forward size for "attn" (None: 2 * afw_attn_dim)
         self.afw_attn_dim = 128     # token size for "attn"
         self.afw_heads = 4          # attention heads for "attn"
+        # "softmax": level weights sum to 1 (levels share a fixed total);
+        # "sigmoid": independent gate in (0, 1) per level;
+        # "free": each level scaled by 1 + score, no normalization, floor or cap
+        self.afw_weight = "softmax"
         self.use_class_weights = True
         self.class_weight_mode = "sqrt_share"  # "sqrt_share" | "inv_sqrt"
         self.reg_weight = 4.0
@@ -84,6 +92,7 @@ class QACSPNetExp(Exp):
             invert=as_bool(self.qge_invert), alpha_mode=str(self.qge_alpha),
             alpha_init=float(self.qge_alpha_init), reduction=int(self.qge_reduction),
             spatial_kernel=int(self.qge_spatial_kernel), dilation=int(self.bottleneck_dilation),
+            gate_mode=str(self.qge_gate),
         )
 
     def gce_cfg(self):
@@ -98,6 +107,7 @@ class QACSPNetExp(Exp):
             afw_type=str(self.afw_type), num_layers=int(self.afw_layers),
             hidden=None if hidden in (None, "", "None") else int(hidden),
             attn_dim=int(self.afw_attn_dim), num_heads=int(self.afw_heads),
+            weight_mode=str(self.afw_weight),
         )
 
     def get_class_counts(self):

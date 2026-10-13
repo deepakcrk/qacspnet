@@ -31,13 +31,21 @@ class QualityGuidedEnhancement(nn.Module):
     alpha_mode="free": learnable, unbounded; "bounded": learnable, sigmoid(.) in
     (0, 1); "fixed": constant alpha_init. reduction sets the FC hidden size
     max(C / reduction, 8); spatial_kernel is the spatial-branch kernel (odd).
+
+    gate_mode="sigmoid": both branches end in a sigmoid, so the gate is in (0, 1)
+    and the output is x scaled by a factor in [1 - alpha, 1] (attenuation only,
+    at most alpha). gate_mode="free": no sigmoid on either branch, the raw
+    scores are used, so the scale per channel/position is unconstrained (it can
+    amplify, attenuate or flip sign by any amount).
     """
 
     def __init__(self, channels, reduction=8, alpha_init=0.5, use_quality=True,
                  qge_type="global", local_kernel=7, invert=True, alpha_mode="free",
-                 spatial_kernel=7, use_spatial=True):
+                 spatial_kernel=7, use_spatial=True, gate_mode="sigmoid"):
         super().__init__()
         assert qge_type in ("global", "local"), qge_type
+        assert gate_mode in ("sigmoid", "free"), gate_mode
+        self.gate_mode = gate_mode
         assert local_kernel >= 1 and local_kernel % 2 == 1, "local_kernel must be odd"
         assert spatial_kernel >= 1 and spatial_kernel % 2 == 1, "spatial_kernel must be odd"
         assert alpha_mode in ("free", "bounded", "fixed"), alpha_mode
@@ -67,12 +75,16 @@ class QualityGuidedEnhancement(nn.Module):
     def blend_factor(self):
         return torch.sigmoid(self.alpha) if self.alpha_mode == "bounded" else self.alpha
 
+    def _gate(self, s):
+        """Raw score -> gate: sigmoid (bounded in (0, 1)) or the score itself (free)."""
+        return torch.sigmoid(s) if self.gate_mode == "sigmoid" else s
+
     def forward(self, x):
         # spatial attention: [mean_c; max_c] -> 7x7 conv -> sigmoid
         if self.use_spatial:
             f_avg = x.mean(dim=1, keepdim=True)
             f_max = x.amax(dim=1, keepdim=True)
-            attn = torch.sigmoid(self.spatial(torch.cat([f_avg, f_max], dim=1)))
+            attn = self._gate(self.spatial(torch.cat([f_avg, f_max], dim=1)))
         else:
             attn = x.new_ones(())
 
@@ -81,7 +93,7 @@ class QualityGuidedEnhancement(nn.Module):
             if self.qge_type == "global":
                 # |DWConv(x)| -> GAP -> FC-SiLU-FC -> sigmoid -> 1 - w   (B x C x 1 x 1)
                 z = edge.mean(dim=(2, 3))
-                w_quality = torch.sigmoid(self.fc2(F.silu(self.fc1(z))))
+                w_quality = self._gate(self.fc2(F.silu(self.fc1(z))))
                 a_quality = (1.0 - w_quality if self.invert else w_quality)[:, :, None, None]
             else:
                 # |DWConv(x)| -> local average -> FC-SiLU-FC per position -> 1 - w   (B x C x H x W)
@@ -89,7 +101,7 @@ class QualityGuidedEnhancement(nn.Module):
                 if k > 1:
                     edge = F.avg_pool2d(edge, k, 1, k // 2, count_include_pad=False)
                 z = edge.permute(0, 2, 3, 1)  # B x H x W x C
-                w_quality = torch.sigmoid(self.fc2(F.silu(self.fc1(z))))
+                w_quality = self._gate(self.fc2(F.silu(self.fc1(z))))
                 w_quality = w_quality.permute(0, 3, 1, 2)
                 a_quality = 1.0 - w_quality if self.invert else w_quality
             attn = a_quality * attn
@@ -171,6 +183,29 @@ class QACSPLayer(nn.Module):
         return self.conv3(self.dwconv(x))
 
 
+class ResidualMLP(nn.Module):
+    """Deeper weight predictor: Linear(in, hidden), then `num_layers` pre-norm residual
+    blocks x = x + Linear(GELU(Linear(LayerNorm(x)))), then LayerNorm + Linear(hidden, out).
+    Operates on the last dimension of any (..., in) tensor."""
+
+    def __init__(self, in_dim, hidden, out_dim, num_layers, expand=2):
+        super().__init__()
+        self.proj = nn.Linear(in_dim, hidden)
+        self.blocks = nn.ModuleList(
+            nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, expand * hidden), nn.GELU(),
+                          nn.Linear(expand * hidden, hidden))
+            for _ in range(num_layers)
+        )
+        self.norm = nn.LayerNorm(hidden)
+        self.out = nn.Linear(hidden, out_dim)
+
+    def forward(self, x):
+        x = self.proj(x)
+        for blk in self.blocks:
+            x = x + blk(x)
+        return self.out(self.norm(x))
+
+
 class AdaptiveFPNWeighting(nn.Module):
     """Adaptive FPN weighting (AFW): GAP of each level -> weight predictor ->
     softmax over levels -> each level scaled by its weight.
@@ -178,20 +213,43 @@ class AdaptiveFPNWeighting(nn.Module):
     afw_type="mlp":  levels' GAP vectors concatenated -> `num_layers` fully
                      connected layers (ReLU between them); `hidden` units in the
                      hidden layers (default sum(C) / 4).
+    afw_type="deep": deeper / wider predictor: the concatenated GAP vectors are
+                     projected to `hidden` units (default sum(C), 4x the mlp
+                     default), followed by `num_layers` pre-norm residual MLP
+                     blocks (LayerNorm -> Linear(2 x hidden) -> GELU -> Linear)
+                     and a final LayerNorm + Linear to the level scores. Use it
+                     to test how much a bigger AFW contributes (e.g.
+                     num_layers=6, hidden=1024).
     afw_type="attn": each level's GAP vector is projected to `attn_dim` and
                      treated as one token (plus a learned level embedding);
                      `num_layers` Transformer self-attention layers with
                      `num_heads` heads; a linear layer scores each token.
+
+    weight_mode="softmax": the level scores are softmax-normalized, so the
+                     weights sum to 1 and the levels share a fixed total (a
+                     level can only grow if another shrinks). min_weight and
+                     base/share further constrain this mode.
+    weight_mode="sigmoid": each level gets an independent gate sigmoid(score)
+                     in (0, 1); no sharing between levels.
+    weight_mode="free": each level is scaled by 1 + score directly, with no
+                     normalization, floor or cap: the scale is whatever AFW
+                     predicts (the levels start at 1, i.e. unchanged).
     """
 
     def __init__(self, in_channels, afw_type="mlp", num_layers=3, hidden=None,
                  attn_dim=128, num_heads=4, dropout=0.0, min_weight=0.0, norm_input=False,
-                 base=None, share=0.1, per_column=False):
+                 base=None, share=0.1, per_column=False, weight_mode="softmax"):
         super().__init__()
-        assert afw_type in ("mlp", "attn"), afw_type
+        assert afw_type in ("mlp", "deep", "attn"), afw_type
         assert num_layers >= 1, "num_layers must be >= 1"
+        assert weight_mode in ("softmax", "sigmoid", "free"), weight_mode
+        self.mlp_like = afw_type in ("mlp", "deep")  # one predictor on the concatenated levels
         self.afw_type = afw_type
+        self.weight_mode = weight_mode
         n = len(in_channels)
+        if weight_mode != "softmax":
+            assert min_weight == 0.0 and base is None, \
+                "min_weight and base only apply to weight_mode='softmax'"
         # floor on each level's weight: w = m + (1 - n*m) * softmax (still sums to 1)
         assert 0.0 <= min_weight * n < 1.0, "min_weight must be < 1 / number of levels"
         self.min_weight = min_weight
@@ -221,6 +279,9 @@ class AdaptiveFPNWeighting(nn.Module):
                 if i < num_layers - 1:
                     layers.append(nn.ReLU(inplace=True))
             self.mlp = nn.Sequential(*layers)
+        elif afw_type == "deep":
+            total = sum(in_channels)
+            self.mlp = ResidualMLP(total, hidden or total, n, num_layers)
         else:
             assert attn_dim % num_heads == 0, "attn_dim must be divisible by num_heads"
             self.proj = nn.ModuleList(nn.Linear(c, attn_dim) for c in in_channels)
@@ -244,10 +305,18 @@ class AdaptiveFPNWeighting(nn.Module):
                 v = F.interpolate(v, size=w0, mode="linear", align_corners=False)
             cols.append(v)
         p = torch.cat(cols, dim=1).transpose(1, 2)  # B x W0 x total
-        return torch.softmax(self.mlp(p), dim=-1).transpose(1, 2)  # B x levels x W0
+        return self._weights(self.mlp(p)).transpose(1, 2)  # B x levels x W0
+
+    def _weights(self, logits):
+        """Level scores (..., levels) -> level weights, by weight_mode."""
+        if self.weight_mode == "softmax":
+            return torch.softmax(logits, dim=-1)
+        if self.weight_mode == "sigmoid":
+            return torch.sigmoid(logits)
+        return 1.0 + logits  # free: unconstrained scale per level
 
     def forward(self, feats):
-        if self.afw_type == "mlp" and self.per_column:
+        if self.mlp_like and self.per_column:
             w = self._column_weights(feats)
             if self.base is not None:
                 w = (1.0 - self.share) * self.base.to(w.dtype)[None, :, None] + self.share * w
@@ -260,7 +329,7 @@ class AdaptiveFPNWeighting(nn.Module):
                     wi = F.adaptive_avg_pool1d(wi, f.shape[-1])
                 out.append(f * wi[:, :, None, :])
             return tuple(out)
-        if self.afw_type == "mlp":
+        if self.mlp_like:
             pooled = [f.mean(dim=(2, 3)) for f in feats]
             if self.norm_input:
                 pooled = [F.layer_norm(v, v.shape[-1:]) for v in pooled]
@@ -271,7 +340,7 @@ class AdaptiveFPNWeighting(nn.Module):
                 [proj(f.mean(dim=(2, 3))) for proj, f in zip(self.proj, feats)], dim=1
             )  # B x levels x attn_dim
             logits = self.score(self.attn(tokens + self.level_emb)).squeeze(-1)
-        w = torch.softmax(logits, dim=1)
+        w = self._weights(logits)
         if self.base is not None:
             w = (1.0 - self.share) * self.base.to(w.dtype) + self.share * w
         elif self.min_weight > 0:
