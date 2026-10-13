@@ -174,11 +174,28 @@ class QACSPNetExp(Exp):
             self.head_width = hw
             head = make_head(hw)
             self.model = YOLOX(backbone, head)
+            self.log_split()
 
         self.model.apply(init_yolo)
         self.model.head.initialize_biases(1e-2)
         self.model.train()
         return self.model
+
+    def log_split(self):
+        """Log how the GFLOPs and parameters are shared between backbone+neck and head."""
+        try:
+            b, h = compute_split(self.model, self.test_size)
+        except Exception as e:  # thop missing, etc.: the split is informational only
+            logger.warning(f"backbone/head split not computed: {e}")
+            return
+        gf, pa = b["gflops"] + h["gflops"], b["params"] + h["params"]
+        logger.info(
+            f"head_width {float(self.head_width):.3f} | GFLOPs {gf:.2f} "
+            f"(backbone+neck {b['gflops']:.2f} = {b['gflops'] / gf:.1%}, "
+            f"head {h['gflops']:.2f} = {h['gflops'] / gf:.1%}) | params {pa:.2f}M "
+            f"(backbone+neck {b['params']:.2f}M = {b['params'] / pa:.1%}, "
+            f"head {h['params']:.2f}M = {h['params'] / pa:.1%})"
+        )
 
     def get_dataset(self, cache: bool = False, cache_type: str = "ram"):
         from qacspnet.data import COCODataset, TrainTransform

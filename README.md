@@ -1,8 +1,7 @@
 # QA-CSPNet
 
 Code for *Quality Aware Feature Learning for Object Detection and Scene Text
-Detection and Recognition*, built on
-[YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) (Apache License 2.0, see `LICENSE`).
+Detection and Recognition*.
 
 
 ## Installation
@@ -11,12 +10,6 @@ Detection and Recognition*, built on
 pip install -r requirements.txt
 pip install -v -e .
 ```
-
-## Trained weights
-
-Trained checkpoints can be downloaded from
-[OneDrive](https://amritavishwavidyapeetham-my.sharepoint.com/:u:/g/personal/cr_deepak_cb_students_amrita_edu/IQDS63ekuM11Q7G-LiTTHoOdAXMwOKY7gp1tT_byRwkeUVQ?e=nOBkyU).
-Pass the downloaded `.pth` file to `-c` (detection) or `--ckpt` (recognition) in the commands below.
 
 ## Data
 
@@ -79,6 +72,21 @@ to the train command, e.g. `... --fp16 qge_type local use_gce True`.
 | `no_decay_modules` | QGE layers | Modules excluded from weight decay. |
 | `output_dir` | `./outputs` | Folder for checkpoints and logs (one subfolder per experiment). |
 | `seed` / `QACSP_SEED` (env) | none | Random seed, e.g. `QACSP_SEED=1 python tools/train.py ...`. |
+
+Backbone / head budget: `depth` and `width` size the backbone and neck, `head_width` sizes
+the head on its own, and `target_head_flops` or `target_head_params` sets the head's share
+of the whole model (fraction in 0-1; `head_width` is then solved automatically). All of
+them can be given on the command line, and the resulting split is logged when the model
+is built:
+
+```bash
+# head gets 20% of the FLOPs
+python tools/train.py -f exps/cocotext/qacspnet_s_cocotext.py -d 1 -b 16 --fp16 target_head_flops 0.20
+# head gets 30% of the parameters
+python tools/train.py -f exps/cocotext/qacspnet_s_cocotext.py -d 1 -b 16 --fp16 target_head_params 0.30
+# head channels halved, backbone unchanged
+python tools/train.py -f exps/cocotext/qacspnet_s_cocotext.py -d 1 -b 16 --fp16 head_width 0.5
+```
 
 Ready-made component switches: `exps/cocotext/ablate_*.py`.
 
@@ -218,3 +226,8 @@ python tools/train_textnet.py --variant s --root datasets/COCOText_words \
 | `--seed` | | Random seed. |
 | `--metrics-out` | | JSON file for the final test accuracies. |
 
+## Trained weights
+
+Trained checkpoints can be downloaded from
+[OneDrive](https://amritavishwavidyapeetham-my.sharepoint.com/:u:/g/personal/cr_deepak_cb_students_amrita_edu/IQDS63ekuM11Q7G-LiTTHoOdAXMwOKY7gp1tT_byRwkeUVQ?e=nOBkyU).
+Pass the downloaded `.pth` file to `-c` (detection) or `--ckpt` (recognition) in the commands above.
